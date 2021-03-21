@@ -7,6 +7,7 @@
 
 import Foundation
 import UIKit
+import CoreData
 
 enum ImageResult {
     case Success(UIImage)
@@ -19,6 +20,7 @@ enum PhotoError: Error{
 
 class PhotoStore {
     let coreDataStack = CoreDataStack(modelName: "Photorama")
+    let imageStore = ImageStore()
     
     let session: URLSession = {
         let config = URLSessionConfiguration.default
@@ -37,29 +39,35 @@ class PhotoStore {
             }
             
             
-            let result = self.processRecentPhotosRequest(data: data, error: error)
+            var result = self.processRecentPhotosRequest(data: data, error: error)
+            if case let .Success(photos) = result {
+                let mainQueueContext = self.coreDataStack.mainQueueContext
+                mainQueueContext.performAndWait {
+                    try! mainQueueContext.obtainPermanentIDs(for: photos)
+                }
+                let objectIDs = photos.map{ $0.objectID }
+                let predicate = NSPredicate(format: "self IN %@", objectIDs)
+                let sortByDateTaken = NSSortDescriptor(key: "dateTaken", ascending: true)
+                             
+                do {
+                    try self.coreDataStack.saveChanges()
+                    let mainQueuePhotos = try self.fetchMainQueuePhotos(predicate: predicate, sortDescriptors: [sortByDateTaken])
+                    result = .Success(mainQueuePhotos)
+                }
+                catch let error {
+                    result = .Failure(error)
+                }
+            }
             completion(result)
-//            if let jsonData = data {
-//                do {
-//                    let jsonObject = try JSONSerialization.jsonObject(with: jsonData, options: [])
-//                    print(jsonObject)
-//                }
-//                catch let error {
-//                    print("Error creating JSON object: \(error)")
-//                }
-//            }
-//            else if let requestError = error {
-//                print("Error fetching recent photos: \(requestError)")
-//            } else {
-//                print("Unexpected error with the request")
-//            }
         }
         
         task.resume()
     }
     
     func fetchImageForPhoto(photo: Photo, completion: @escaping(ImageResult) -> Void){
-        if let image = photo.image {
+        let photoKey = photo.photoKey!
+        if let image = imageStore.imageForKey(key: photoKey) {
+            photo.image = image
             completion(.Success(image))
             return
         }
@@ -73,6 +81,7 @@ class PhotoStore {
             let result = self.processImageRequest(data: data, error: error)
             if case let .Success(image) = result {
                 photo.image = image
+                self.imageStore.setImage(image: image, forKey: photoKey)
             }
             
             completion(result)
@@ -99,5 +108,34 @@ class PhotoStore {
             return .Failure(error!)
         }
         return FlickrAPI.photosFromJSONData(data: jsonData, inContext: self.coreDataStack.mainQueueContext)
+    }
+    
+    func fetchMainQueuePhotos(predicate: NSPredicate? = nil,
+                              sortDescriptors: [NSSortDescriptor]? = nil) throws -> [Photo] {
+        
+        let fetchRequest = NSFetchRequest<Photo>(entityName: "Photo")
+        fetchRequest.sortDescriptors = sortDescriptors
+        fetchRequest.predicate = predicate
+        
+        let mainQueueContext = self.coreDataStack.mainQueueContext
+        var mainQueuePhotos = [Photo]()
+        var fetchRequestError: Error?
+        mainQueueContext.performAndWait {
+            do {
+                let items = try fetchRequest.execute()// mainQueueContext.execute(fetchRequest)
+                for item in items {
+                    mainQueuePhotos.append(item)
+                }
+            }
+            catch let error {
+                fetchRequestError = error
+            }
+        }
+        
+        if mainQueuePhotos.count == 0 {
+            throw fetchRequestError!
+        }
+    
+        return mainQueuePhotos
     }
 }
